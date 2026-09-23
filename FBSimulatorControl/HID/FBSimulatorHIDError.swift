@@ -43,6 +43,8 @@ public enum FBSimulatorHIDError: Error, LocalizedError {
   case dtuhidXPCSymbolsUnavailable
   /// The `dtuhidd` host XPC connection could not be created.
   case dtuhidConnectionFailed
+  /// The connection was built, but no live `dtuhidd` answered a liveness probe behind it.
+  case dtuhidUnresponsive(attempts: Int, underlying: Error?)
 
   public var errorDescription: String? {
     switch self {
@@ -76,6 +78,20 @@ public enum FBSimulatorHIDError: Error, LocalizedError {
       return "Could not resolve the private _4sim XPC endpoint symbols required for the DTUHID transport"
     case .dtuhidConnectionFailed:
       return "Could not create the dtuhidd host XPC connection"
+    case let .dtuhidUnresponsive(attempts, underlying):
+      let detail = underlying.map { " (\($0))" } ?? ""
+      return
+        "dtuhidd did not answer a liveness probe in \(attempts) attempts\(detail). Every HID event sent to it would be discarded without error. Wait for the simulator to finish booting, or reboot it, and try again."
+    }
+  }
+
+  /// Whether this failure could clear on its own, so connecting is worth another attempt.
+  var isTransientDTUHIDFailure: Bool {
+    switch self {
+    case .dtuhidDigitizerServiceUnavailable, .dtuhidConnectionFailed, .dtuhidUnresponsive:
+      return true
+    default:
+      return false
     }
   }
 }

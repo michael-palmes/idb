@@ -15,8 +15,8 @@ import XPC
 // MARK: - Timing policy
 
 /// The waits `FBSimulatorDTUHIDTransport` performs around the events it sends. A value type so the
-/// policy is unit-testable without a live `dtuhidd`; the transport never sleeps directly, it goes
-/// through `DTUHIDDrainClock`.
+/// policy is unit-testable without a live `dtuhidd`; the transport never sleeps or reads a clock
+/// directly, it goes through `DTUHIDDrainClock`.
 struct DTUHIDTiming: Equatable, Sendable {
   /// Warm drain: how long a connection whose services are already open is kept up after a gesture.
   var drainNanos: UInt64 = 80_000_000
@@ -26,30 +26,89 @@ struct DTUHIDTiming: Equatable, Sendable {
   var replyTimeoutNanos: UInt64 = 2_000_000_000
   /// Wait taken when a drain barrier goes unanswered. Degrades, never fails.
   var fallbackDrainNanos: UInt64 = 1_000_000_000
+  /// Deadline for the connect-time liveness reply. Longer than `replyTimeoutNanos` because this is
+  /// the send that demand-launches `dtuhidd`.
+  var livenessTimeoutNanos: UInt64 = 4_000_000_000
+  /// Wait between liveness attempts. `dtuhidd` declares a 10s minimum runtime, so launchd throttles
+  /// the respawn of one that aborted early; retrying sooner re-reads the same throttled job.
+  var livenessRetryBackoffNanos: UInt64 = 4_000_000_000
+  /// Liveness attempts before the transport is reported unresponsive.
+  var livenessAttempts: Int = 5
+  /// Minimum time from the connection's first message (the liveness probe) before the transport is
+  /// handed out. `dtuhidd` creates its virtual services on a peer's first message and opens them
+  /// 560-770ms later on Xcode 27.1 (27A9269); events sent before then are held pending and discarded
+  /// if the peer disconnects first, which is what a one-shot CLI does.
+  var activationFloorNanos: UInt64 = 1_000_000_000
 
   static let standard = DTUHIDTiming()
+
+  /// Overrides `activationFloorNanos` (milliseconds, capped at 5000) without rebuilding.
+  static let activationOverrideEnvironmentKey = "FBSIMCONTROL_DTUHID_ACTIVATION_MS"
+
+  static var live: DTUHIDTiming {
+    var timing = standard
+    if let raw = ProcessInfo.processInfo.environment[activationOverrideEnvironmentKey],
+       let milliseconds = UInt64(raw) {
+      timing.activationFloorNanos = min(milliseconds, 5_000) * 1_000_000
+    }
+    return timing
+  }
 }
 
 // MARK: - Injectable clock
 
-/// Injectable waits for the DTUHID transport.
+/// Injectable waits for the DTUHID transport. Every closure is required, so a call site cannot get a
+/// liveness probe that silently always succeeds.
 struct DTUHIDDrainClock: Sendable {
+  /// Monotonic nanoseconds.
+  let now: @Sendable () -> UInt64
   let sleep: @Sendable (UInt64) async throws -> Void
   /// Sends a barrier and resolves on any reply (including an XPC error); throws
   /// `DTUHIDDrainTimeout.expired` at the deadline.
   let awaitBarrierReply: @Sendable (xpc_connection_t, xpc_object_t, UInt64) async throws -> Void
+  /// Sends a barrier and resolves only on a real peer reply; throws `DTUHIDLivenessFailure`.
+  let awaitLivenessReply: @Sendable (xpc_connection_t, xpc_object_t, UInt64) async throws -> Void
 
   static let live = DTUHIDDrainClock(
+    now: { DispatchTime.now().uptimeNanoseconds },
     sleep: { try await Task.sleep(nanoseconds: $0) },
     awaitBarrierReply: { connection, message, timeout in
       // Any reply ends the await: a dead connection is past protecting, and the tail is harmless.
       _ = try await awaitXPCReply(connection, message, timeoutNanos: timeout)
+    },
+    awaitLivenessReply: { connection, message, timeout in
+      let reply: XPCReply
+      do {
+        reply = try await awaitXPCReply(connection, message, timeoutNanos: timeout)
+      } catch {
+        throw DTUHIDLivenessFailure.timedOut(nanos: timeout)
+      }
+      if let errorDescription = reply.errorDescription {
+        throw DTUHIDLivenessFailure.peerUnavailable(errorDescription)
+      }
     })
 }
 
 /// A drain barrier deadline expired; `flush()` takes the fallback drain.
 enum DTUHIDDrainTimeout: Error {
   case expired
+}
+
+/// Nothing live was found behind a DTUHID connection at connect time.
+enum DTUHIDLivenessFailure: Error, CustomStringConvertible {
+  /// The probe went unanswered: `dtuhidd` is throttled, crash-looping, or wedged.
+  case timedOut(nanos: UInt64)
+  /// XPC answered on the peer's behalf, so no daemon took the message.
+  case peerUnavailable(String)
+
+  var description: String {
+    switch self {
+    case let .timedOut(nanos):
+      return "no reply within \(nanos / 1_000_000) ms"
+    case let .peerUnavailable(detail):
+      return detail
+    }
+  }
 }
 
 /// What came back from a barrier, carried out of the XPC queue as plain values.
@@ -101,8 +160,7 @@ private func awaitXPCReply(
 // MARK: - Contact tracking
 
 /// Tracks the per-contact phase so that a stream of Indigo `.down`/`.up` events maps onto the
-/// `dtuhidd` `start` / `position` / `end` model: the first `.down` is a `start`, subsequent `.down`s
-/// (a drag/swipe) are `position`s, and `.up` is the `end`.
+/// `dtuhidd` `start` / `position` / `end` model.
 struct DigitizerContactTracker {
   private var active = false
 
@@ -121,35 +179,31 @@ struct DigitizerContactTracker {
   }
 }
 
+// MARK: - Transport
+
 /**
- The DTUHID transport (Xcode 27 / macOS 26 / iOS 26+).
+ The DTUHID transport (Xcode 27 / iOS 26+).
 
- Drives the modern `dtuhidd` daemon: events cross the host→guest boundary as plain-XPC dictionaries
- delivered to the `com.apple.coredevice.feature.remote.hid.digitizer` service. Each message is built
- as an `Encodable` model (e.g. `IndigoDigitizerEvent`) wrapped in a `DTUHIDMessage` envelope and
- serialized with `XPCEncoder`, rather than hand-rolled `xpc_dictionary_set_*` calls. The host XPC
- connection is built from the simulator's Mach port via the private `_4sim` endpoint symbols
- (resolved with `dlsym`) and must be marked simulator-to-host with `xpc_connection_enable_sim2host_4sim`
- before messages reach the service handler.
+ Events cross the host to guest boundary as plain-XPC dictionaries (`DTUHIDMessage` envelopes
+ serialized by `XPCEncoder`) delivered to `com.apple.coredevice.feature.remote.hid.digitizer` over a
+ connection built from the simulator's Mach port with the private `_4sim` symbols.
 
- Capabilities are added one per commit; not-yet-implemented primitives throw
- `notImplementedOnDTUHIDTransport` rather than silently falling back to Indigo.
-
- An `actor`: the mutable contact state is actor-isolated, so the type needs no `@unchecked Sendable`.
- The XPC connection handle is thread-safe, so `disconnect()` cancels it from a `nonisolated` context.
+ Readiness: `dtuhidd` creates its virtual services on a peer's first message and opens them later;
+ events arriving before then are held pending and discarded if the peer disconnects. The factory
+ therefore proves a live daemon with a barrier round trip (retried, since `dtuhidd` can abort during
+ a slow boot) and waits out `activationFloorNanos`. The first drain after real sends round-trips
+ another barrier so the gesture is known to be dequeued before the process can exit; later drains
+ take the short warm drain; drains with nothing outstanding are skipped.
  */
 actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
 
   static let digitizerServiceName = "com.apple.coredevice.feature.remote.hid.digitizer"
 
-  // Private XPC endpoint functions, resolved at runtime (not in the XPC module headers).
   private typealias EndpointFromMachPortFn = @convention(c) (mach_port_t, UInt64, UInt64) -> xpc_object_t?
   private typealias ConnectionFromEndpointFn = @convention(c) (xpc_object_t) -> xpc_connection_t?
   private typealias EnableSim2HostFn = @convention(c) (xpc_connection_t) -> Void
 
-  /// The host→guest XPC connection to `dtuhidd`. XPC connections are thread-safe, so it is marked
-  /// `nonisolated(unsafe)` to be read from the `nonisolated` `disconnect()` as well as the
-  /// actor-isolated send path.
+  /// XPC connections support concurrent sending and cancellation.
   nonisolated(unsafe) private let connection: xpc_connection_t
   private let mainScreenSize: CGSize
   private let mainScreenScale: Float
@@ -164,9 +218,76 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
 
   // MARK: Initializers
 
-  /// Builds a DTUHID transport for the provided Simulator, establishing the host XPC connection to
-  /// `dtuhidd`. Async so that connecting can wait on the daemon before the transport is handed out.
-  static func dtuhid(for simulator: FBSimulator) async throws -> FBSimulatorDTUHIDTransport {
+  /// Connects to the simulator's DTUHID service and returns only once a live `dtuhidd` has answered
+  /// a liveness probe and the activation floor has passed. Throws `dtuhidUnresponsive` if no attempt
+  /// is answered, rather than handing out a transport whose every event would be discarded.
+  static func dtuhid(
+    for simulator: FBSimulator,
+    timing: DTUHIDTiming = .live,
+    clock: DTUHIDDrainClock = .live
+  ) async throws -> FBSimulatorDTUHIDTransport {
+    let logger = FBControlCoreGlobalConfiguration.defaultLogger
+    return try await connectConfirmingLiveness(timing: timing, clock: clock, logger: logger) {
+      try await connected(to: simulator, timing: timing, clock: clock, logger: logger)
+    }
+  }
+
+  /// The retry policy, separated from connection building so it is testable without a simulator.
+  static func connectConfirmingLiveness(
+    timing: DTUHIDTiming,
+    clock: DTUHIDDrainClock,
+    logger: (any FBControlCoreLogger)?,
+    attempt: () async throws -> FBSimulatorDTUHIDTransport
+  ) async throws -> FBSimulatorDTUHIDTransport {
+    let attempts = max(1, timing.livenessAttempts)
+    var lastFailure: Error?
+    for index in 1...attempts {
+      do {
+        return try await attempt()
+      } catch let error as FBSimulatorHIDError where !error.isTransientDTUHIDFailure {
+        // A toolchain without the `_4sim` symbols will not grow them by being asked again.
+        throw error
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch {
+        lastFailure = error
+        logger?.log("dtuhidd did not answer the liveness probe (attempt \(index) of \(attempts)): \(error)")
+        guard index < attempts else {
+          break
+        }
+        try await clock.sleep(timing.livenessRetryBackoffNanos)
+      }
+    }
+    throw FBSimulatorHIDError.dtuhidUnresponsive(attempts: attempts, underlying: lastFailure)
+  }
+
+  /// One attempt. The service lookup lives inside the attempt: it fails while launchd is
+  /// respawning the job, which is exactly the state being retried out of.
+  private static func connected(
+    to simulator: FBSimulator,
+    timing: DTUHIDTiming,
+    clock: DTUHIDDrainClock,
+    logger: (any FBControlCoreLogger)?
+  ) async throws -> FBSimulatorDTUHIDTransport {
+    let transport = FBSimulatorDTUHIDTransport(
+      connection: try connection(for: simulator),
+      mainScreenSize: simulator.device.deviceType.mainScreenSize,
+      mainScreenScale: simulator.device.deviceType.mainScreenScale,
+      timing: timing,
+      clock: clock)
+    do {
+      let latency = try await transport.confirmLiveness()
+      logger?.log("dtuhidd answered the liveness probe in \(latency / 1_000_000) ms")
+    } catch {
+      transport.disconnect()
+      throw error
+    }
+    return transport
+  }
+
+  /// A resumed host XPC connection to the guest digitizer service. Says nothing about whether
+  /// `dtuhidd` can run: launchd vends the port for a demand-launched job either way.
+  private static func connection(for simulator: FBSimulator) throws -> xpc_connection_t {
     guard let handle = dlopen(nil, RTLD_NOW) else {
       throw FBSimulatorHIDError.dtuhidXPCSymbolsUnavailable
     }
@@ -183,23 +304,17 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
     if servicePort == 0 {
       throw FBSimulatorHIDError.dtuhidDigitizerServiceUnavailable(underlying: lookupError)
     }
-
     guard
       let endpoint = endpointFromPort(servicePort, 0, 0),
       let connection = connectionFromEndpoint(endpoint)
     else {
       throw FBSimulatorHIDError.dtuhidConnectionFailed
     }
-
     // The load-bearing step: without this the daemon observes the peer but never the payload.
     enableSim2Host(connection)
     xpc_connection_set_event_handler(connection) { _ in }
     xpc_connection_resume(connection)
-
-    return FBSimulatorDTUHIDTransport(
-      connection: connection,
-      mainScreenSize: simulator.device.deviceType.mainScreenSize,
-      mainScreenScale: simulator.device.deviceType.mainScreenScale)
+    return connection
   }
 
   init(
@@ -221,6 +336,26 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
       return nil
     }
     return unsafeBitCast(sym, to: type)
+  }
+
+  // MARK: Liveness
+
+  /// Round-trips an inert barrier to prove a `dtuhidd` is behind the connection, then waits until
+  /// `activationFloorNanos` after the probe was sent so the services it created are open before the
+  /// caller's first event. Returns the reply latency (for diagnostics and tuning).
+  ///
+  /// Deliberately does not settle the cold drain (upstream 92cc718f does): on Xcode 27.1 the reply
+  /// can precede device-open, so the first real gesture still round-trips its own barrier.
+  @discardableResult
+  func confirmLiveness() async throws -> UInt64 {
+    let probeSentAt = clock.now()
+    try await clock.awaitLivenessReply(connection, barrierMessage(), timing.livenessTimeoutNanos)
+    let answeredAt = clock.now()
+    let latency = answeredAt >= probeSentAt ? answeredAt - probeSentAt : 0
+    if timing.activationFloorNanos > latency {
+      try await clock.sleep(timing.activationFloorNanos - latency)
+    }
+    return latency
   }
 
   // MARK: FBSimulatorHIDTransport
