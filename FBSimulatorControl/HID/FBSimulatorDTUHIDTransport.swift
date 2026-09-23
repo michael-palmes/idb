@@ -97,8 +97,8 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
   // MARK: Initializers
 
   /// Builds a DTUHID transport for the provided Simulator, establishing the host XPC connection to
-  /// `dtuhidd`. All setup is synchronous, so the returned transport is ready to send.
-  static func dtuhid(for simulator: FBSimulator) throws -> FBSimulatorDTUHIDTransport {
+  /// `dtuhidd`. Async so that connecting can wait on the daemon before the transport is handed out.
+  static func dtuhid(for simulator: FBSimulator) async throws -> FBSimulatorDTUHIDTransport {
     guard let handle = dlopen(nil, RTLD_NOW) else {
       throw FBSimulatorHIDError.dtuhidXPCSymbolsUnavailable
     }

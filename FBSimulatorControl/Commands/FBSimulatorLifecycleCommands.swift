@@ -85,7 +85,7 @@ public final class FBSimulatorLifecycleCommands: NSObject, FBiOSTargetCommand {
   // MARK: - Properties
 
   private weak var simulator: FBSimulator?
-  private var hid: FBSimulatorHID?
+  private var hidConnection: Task<FBSimulatorHID, Error>?
 
   // MARK: - Initializers
 
@@ -253,8 +253,14 @@ public final class FBSimulatorLifecycleCommands: NSObject, FBiOSTargetCommand {
   }
 
   private func terminateConnectionsAsync() async throws {
-    hid?.disconnect()
-    self.hid = nil
+    guard let connection = hidConnection else {
+      return
+    }
+    // Detach before suspending so a concurrent connect starts afresh.
+    hidConnection = nil
+    if let hid = try? await connection.value {
+      hid.disconnect()
+    }
   }
 
   fileprivate func connectToFramebufferAsync() async throws -> FBFramebuffer {
@@ -265,15 +271,23 @@ public final class FBSimulatorLifecycleCommands: NSObject, FBiOSTargetCommand {
   }
 
   fileprivate func connectToHIDAsync() async throws -> FBSimulatorHID {
-    if let hid = self.hid {
-      return hid
+    // Concurrent callers share one in-flight connection attempt.
+    if let hidConnection {
+      return try await hidConnection.value
     }
     guard let simulator = self.simulator else {
       throw FBSimulatorError.describe("Simulator deallocated").build()
     }
-    let hid = try FBSimulatorHID(for: simulator)
-    self.hid = hid
-    return hid
+    let connection = Task { try await FBSimulatorHID(for: simulator) }
+    hidConnection = connection
+    do {
+      return try await connection.value
+    } catch {
+      if hidConnection == connection {
+        hidConnection = nil
+      }
+      throw error
+    }
   }
 
   fileprivate func openAsync(_ url: URL) async throws {
