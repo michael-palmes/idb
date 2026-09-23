@@ -12,6 +12,30 @@ import Darwin
 import Foundation
 import XPC
 
+// MARK: - Timing policy
+
+/// The waits `FBSimulatorDTUHIDTransport` performs around the events it sends. A value type so the
+/// policy is unit-testable without a live `dtuhidd`; the transport never sleeps directly, it goes
+/// through `DTUHIDDrainClock`.
+struct DTUHIDTiming: Equatable, Sendable {
+  /// How long the connection is kept up after a gesture's events are sent.
+  var drainNanos: UInt64 = 80_000_000
+
+  static let standard = DTUHIDTiming()
+}
+
+// MARK: - Injectable clock
+
+/// Injectable waits for the DTUHID transport.
+struct DTUHIDDrainClock: Sendable {
+  let sleep: @Sendable (UInt64) async throws -> Void
+
+  static let live = DTUHIDDrainClock(
+    sleep: { try await Task.sleep(nanoseconds: $0) })
+}
+
+// MARK: - Contact tracking
+
 /// Tracks the per-contact phase so that a stream of Indigo `.down`/`.up` events maps onto the
 /// `dtuhidd` `start` / `position` / `end` model: the first `.down` is a `start`, subsequent `.down`s
 /// (a drag/swipe) are `position`s, and `.up` is the `end`.
@@ -59,21 +83,14 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
   private typealias ConnectionFromEndpointFn = @convention(c) (xpc_object_t) -> xpc_connection_t?
   private typealias EnableSim2HostFn = @convention(c) (xpc_connection_t) -> Void
 
-  /// Time `flush()` keeps the connection alive after a gesture's events are sent, so `dtuhidd`
-  /// consumes them before the connection is torn down. `dtuhidd` resets its virtual services
-  /// (dropping any in-flight gesture) the instant the host peer disconnects — which, for a one-shot
-  /// gesture from a short-lived host process, is the moment that process exits right after the send.
-  /// The XPC send barrier only confirms the bytes reached the connection, not that the daemon
-  /// consumed them, and `dtuhidd` does not reply to events or barriers — so a bounded wait is the
-  /// only signal available. It runs once per gesture (in `flush()`), not after every primitive.
-  private static let drainNanos: UInt64 = 80_000_000 // 80ms
-
   /// The host→guest XPC connection to `dtuhidd`. XPC connections are thread-safe, so it is marked
   /// `nonisolated(unsafe)` to be read from the `nonisolated` `disconnect()` as well as the
   /// actor-isolated send path.
   nonisolated(unsafe) private let connection: xpc_connection_t
   private let mainScreenSize: CGSize
   private let mainScreenScale: Float
+  private let timing: DTUHIDTiming
+  private let clock: DTUHIDDrainClock
   private var contact = DigitizerContactTracker()
   private var twoFingerContact = DigitizerContactTracker()
 
@@ -117,10 +134,18 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
       mainScreenScale: simulator.device.deviceType.mainScreenScale)
   }
 
-  init(connection: xpc_connection_t, mainScreenSize: CGSize, mainScreenScale: Float) {
+  init(
+    connection: xpc_connection_t,
+    mainScreenSize: CGSize,
+    mainScreenScale: Float,
+    timing: DTUHIDTiming = .standard,
+    clock: DTUHIDDrainClock = .live
+  ) {
     self.connection = connection
     self.mainScreenSize = mainScreenSize
     self.mainScreenScale = mainScreenScale
+    self.timing = timing
+    self.clock = clock
   }
 
   private static func symbol<T>(_ handle: UnsafeMutableRawPointer, _ name: String, as type: T.Type) -> T? {
@@ -196,11 +221,11 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
     }
   }
 
-  /// Drains the connection once a gesture's events have all been sent: waits `drainNanos` so
-  /// `dtuhidd` consumes them before the connection is torn down. Run once per gesture (see
-  /// `drainNanos`), not after every primitive.
+  /// Drains the connection once a gesture's events have all been sent: waits `timing.drainNanos`
+  /// so `dtuhidd` consumes them before the connection is torn down. Run once per gesture, not after
+  /// every primitive.
   func flush() async throws {
-    try? await Task.sleep(nanoseconds: Self.drainNanos)
+    try? await clock.sleep(timing.drainNanos)
   }
 
 }

@@ -71,7 +71,14 @@ public final class FBSimulatorHID: CustomStringConvertible, @unchecked Sendable 
     self.init(transport: transport, transportType: resolvedTransportType, purple: FBSimulatorPurpleHID(), simulator: simulator)
   }
 
-  private init(transport: FBSimulatorHIDTransport, transportType: FBSimulatorHIDTransportType, purple: FBSimulatorPurpleHID, simulator: FBSimulator) {
+  /// Designated initializer. Internal (was private) so tests can drive a transport with an injected
+  /// clock; `simulator` is optional because the Purple and Darwin paths are unused there.
+  init(
+    transport: FBSimulatorHIDTransport,
+    transportType: FBSimulatorHIDTransportType,
+    purple: FBSimulatorPurpleHID = FBSimulatorPurpleHID(),
+    simulator: FBSimulator?
+  ) {
     self.transport = transport
     self.transportType = transportType
     self.purple = purple
