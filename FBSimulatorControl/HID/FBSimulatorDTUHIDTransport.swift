@@ -18,8 +18,14 @@ import XPC
 /// policy is unit-testable without a live `dtuhidd`; the transport never sleeps directly, it goes
 /// through `DTUHIDDrainClock`.
 struct DTUHIDTiming: Equatable, Sendable {
-  /// How long the connection is kept up after a gesture's events are sent.
+  /// Warm drain: how long a connection whose services are already open is kept up after a gesture.
   var drainNanos: UInt64 = 80_000_000
+  /// Settle after the first post-send barrier reply, covering device dispatch.
+  var replyTailNanos: UInt64 = 200_000_000
+  /// Deadline for a drain barrier reply before taking `fallbackDrainNanos` instead.
+  var replyTimeoutNanos: UInt64 = 2_000_000_000
+  /// Wait taken when a drain barrier goes unanswered. Degrades, never fails.
+  var fallbackDrainNanos: UInt64 = 1_000_000_000
 
   static let standard = DTUHIDTiming()
 }
@@ -29,9 +35,67 @@ struct DTUHIDTiming: Equatable, Sendable {
 /// Injectable waits for the DTUHID transport.
 struct DTUHIDDrainClock: Sendable {
   let sleep: @Sendable (UInt64) async throws -> Void
+  /// Sends a barrier and resolves on any reply (including an XPC error); throws
+  /// `DTUHIDDrainTimeout.expired` at the deadline.
+  let awaitBarrierReply: @Sendable (xpc_connection_t, xpc_object_t, UInt64) async throws -> Void
 
   static let live = DTUHIDDrainClock(
-    sleep: { try await Task.sleep(nanoseconds: $0) })
+    sleep: { try await Task.sleep(nanoseconds: $0) },
+    awaitBarrierReply: { connection, message, timeout in
+      // Any reply ends the await: a dead connection is past protecting, and the tail is harmless.
+      _ = try await awaitXPCReply(connection, message, timeoutNanos: timeout)
+    })
+}
+
+/// A drain barrier deadline expired; `flush()` takes the fallback drain.
+enum DTUHIDDrainTimeout: Error {
+  case expired
+}
+
+/// What came back from a barrier, carried out of the XPC queue as plain values.
+private struct XPCReply: Sendable {
+  let errorDescription: String?
+}
+
+/// True for exactly one caller, which owns resuming the continuation.
+private final class FirstAnswer: @unchecked Sendable {
+  private let lock = NSLock()
+  private var pending = true
+
+  func claim() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    let wasPending = pending
+    pending = false
+    return wasPending
+  }
+}
+
+/// Sends `message` with a reply handler and resolves with whichever comes first, the reply or the
+/// deadline. A late reply after the deadline (or the error reply on cancel) is ignored.
+private func awaitXPCReply(
+  _ connection: xpc_connection_t, _ message: xpc_object_t, timeoutNanos: UInt64
+) async throws -> XPCReply {
+  try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<XPCReply, Error>) in
+    let answer = FirstAnswer()
+    let queue = DispatchQueue.global(qos: .userInitiated)
+    xpc_connection_send_message_with_reply(connection, message, queue) { reply in
+      var errorDescription: String?
+      if xpc_get_type(reply) == XPC_TYPE_ERROR {
+        errorDescription =
+          xpc_dictionary_get_string(reply, XPC_ERROR_KEY_DESCRIPTION).map { String(cString: $0) }
+          ?? "unknown XPC error"
+      }
+      if answer.claim() {
+        continuation.resume(returning: XPCReply(errorDescription: errorDescription))
+      }
+    }
+    queue.asyncAfter(deadline: .now() + .nanoseconds(Int(clamping: timeoutNanos))) {
+      if answer.claim() {
+        continuation.resume(throwing: DTUHIDDrainTimeout.expired)
+      }
+    }
+  }
 }
 
 // MARK: - Contact tracking
@@ -93,6 +157,10 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
   private let clock: DTUHIDDrainClock
   private var contact = DigitizerContactTracker()
   private var twoFingerContact = DigitizerContactTracker()
+  private var coldDrainState = ColdDrainState.pending
+  // A drain claims a snapshot of the send count; later sends remain outstanding.
+  private var sendGeneration = 0
+  private var drainedGeneration = 0
 
   // MARK: Initializers
 
@@ -200,19 +268,25 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
 
   // MARK: Sending
 
-  /// Wraps `payload` in a `DTUHIDMessage` and serializes it to the `xpc_object_t` `dtuhidd` decodes.
-  /// Pure and stateless, so the envelope shape is unit-testable without a live daemon connection.
-  nonisolated func encode(messageType: String, payload: some Encodable) throws -> xpc_object_t {
+  /// Wraps `payload` in a `DTUHIDMessage` envelope. Pure, so the shape is unit-testable.
+  nonisolated func encode(messageType: String, payload: some Encodable, isBarrier: Bool = false) throws -> xpc_object_t {
     let message = DTUHIDMessage(
-      messageType: messageType, featureIdentifier: Self.digitizerServiceName, payload: payload)
+      messageType: messageType,
+      featureIdentifier: Self.digitizerServiceName,
+      isBarrier: isBarrier,
+      payload: payload)
     return try XPCEncoder().encode(message)
   }
 
-  /// Encodes `payload`, sends it over the connection, and resolves when the XPC send barrier fires.
-  /// The actor serializes calls, so per-gesture state stays consistent. Does not wait for the daemon
-  /// to consume the event — that is `flush()`'s job, run once per gesture rather than per primitive.
+  /// Encodes and writes one event; resolves when the local XPC send barrier fires. Nothing suspends
+  /// between a contact tracker assigning an event type and the write.
   func send(messageType: String, payload: some Encodable) async throws {
-    let object = try encode(messageType: messageType, payload: payload)
+    try await deliver(encode(messageType: messageType, payload: payload))
+  }
+
+  private func deliver(_ object: xpc_object_t) async throws {
+    // Make the send visible to flush before the first suspension.
+    sendGeneration += 1
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       xpc_connection_send_message(connection, object)
       xpc_connection_send_barrier(connection) {
@@ -221,13 +295,71 @@ actor FBSimulatorDTUHIDTransport: FBSimulatorHIDTransport {
     }
   }
 
-  /// Drains the connection once a gesture's events have all been sent: waits `timing.drainNanos`
-  /// so `dtuhidd` consumes them before the connection is torn down. Run once per gesture, not after
-  /// every primitive.
+  /// Allows events sent before this call to reach the guest before disconnecting. The first drain
+  /// with outstanding sends waits for a barrier reply plus `replyTailNanos` (or `fallbackDrainNanos`
+  /// if unanswered within `replyTimeoutNanos`); later drains wait `drainNanos`. Returns immediately
+  /// when nothing is outstanding.
   func flush() async throws {
-    try? await clock.sleep(timing.drainNanos)
+    let generation = sendGeneration
+    guard generation > drainedGeneration else {
+      return
+    }
+    if case .done = coldDrainState {
+      try await clock.sleep(timing.drainNanos)
+    } else {
+      let coldGeneration = try await coldDrain()
+      if generation > coldGeneration {
+        try await clock.sleep(timing.drainNanos)
+      }
+    }
+    drainedGeneration = max(drainedGeneration, generation)
   }
 
+  private enum ColdDrainState {
+    case pending
+    case running(Task<Int, Error>)
+    case done
+  }
+
+  /// Concurrent first flushes share one task; returns the last send it covers. A failed drain
+  /// resets to `.pending` so the next flush retries cold.
+  private func coldDrain() async throws -> Int {
+    if case let .running(task) = coldDrainState {
+      return try await task.value
+    }
+    let generation = sendGeneration
+    let task = Task<Int, Error> {
+      do {
+        try await self.performColdDrain()
+      } catch {
+        self.coldDrainState = .pending
+        throw error
+      }
+      self.coldDrainState = .done
+      return generation
+    }
+    coldDrainState = .running(task)
+    return try await task.value
+  }
+
+  private func performColdDrain() async throws {
+    do {
+      try await clock.awaitBarrierReply(connection, barrierMessage(), timing.replyTimeoutNanos)
+    } catch is DTUHIDDrainTimeout {
+      try await clock.sleep(timing.fallbackDrainNanos)
+      return
+    }
+    try await clock.sleep(timing.replyTailNanos)
+  }
+
+  /// A barrier carrying keyboard usage `0` ("no event indicated"), so the daemon answers without
+  /// the guest seeing a keypress.
+  private nonisolated func barrierMessage() throws -> xpc_object_t {
+    try encode(
+      messageType: "IndigoKeyboardButtonEvent",
+      payload: IndigoKeyboardButtonEvent(usageCode: 0, state: .up),
+      isBarrier: true)
+  }
 }
 
 // MARK: - Button usage mapping
