@@ -5,64 +5,51 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-@preconcurrency import CoreSimulator
-import Darwin
 @preconcurrency import FBControlCore
 import Foundation
 
-// MARK: - Legacy HID suppression
+// MARK: - Transport selection
 
-extension FBSimulator {
+/// Which HID transport a caller that did not request one gets. Pure functions over injected facts.
+///
+/// Deliberately not a probe of whether `dtuhidd` is resident: it is demand-launched and exits when
+/// idle, so it is often not running on a simulator that routes all HID through it. Whether it can
+/// actually be reached is settled by `FBSimulatorDTUHIDTransport.dtuhid(for:)`'s liveness probe.
+enum FBSimulatorHIDTransportSelection {
+  static let firstDTUHIDCoreSimulatorVersion = "1155.4"
 
-  /// Whether an active `dtuhidd` has suppressed this simulator's legacy HID services.
-  ///
-  /// On Xcode 27 (CoreSimulator-1155.4) and later, the host-injected SimulatorHID disconnects the
-  /// legacy `ExternalKeyboardService` while `dtuhidd` is active, so legacy keyboard events are
-  /// delivered byte-correctly but produce no text (touch and the other services are unaffected). Read
-  /// host-side — the authoritative guest notify state `com.apple.coredevice.dtuhidd.active` is not
-  /// host-bridged — by locating `dtuhidd` in this simulator's `launchd_sim` process subtree.
-  var isLegacyHIDSuppressed: Bool {
-    // Only CoreSimulator-1155.4+ (Xcode 27) ships the dtuhidd suppression machinery; older toolchains
-    // have no `dtuhidd`, so skip the process-tree walk entirely.
-    guard let version = FBSimulatorControlFrameworkLoader.loadedCoreSimulatorVersion,
-      version.compare("1155.4", options: .numeric) != .orderedAscending
-    else {
+  static func shipsDTUHID(coreSimulatorVersion: String?) -> Bool {
+    guard let coreSimulatorVersion else {
       return false
     }
-    // `dtuhidd` runs as a child of the simulator's `launchd_sim`; its presence in the process subtree
-    // is the per-simulator signal.
-    return FBProcessFetcher().simulatorSubprocess(named: "dtuhidd", forSimulatorUDID: udid) != nil
+    return coreSimulatorVersion.compare(firstDTUHIDCoreSimulatorVersion, options: .numeric) != .orderedAscending
   }
 
-  /// The HID transport to use when a caller does not request one: the DTUHID transport when an active
-  /// `dtuhidd` has suppressed the legacy HID, and the legacy Indigo path otherwise. The selection
-  /// criteria are deliberately the same as the suppression detection (`isLegacyHIDSuppressed`); this
-  /// can be refined independently later if the two ever need to diverge.
-  var defaultHIDTransport: FBSimulatorHIDTransportType {
-    isLegacyHIDSuppressed ? .dtuhid : .indigo
+  /// From 1155.4 the guest hands the legacy keyboard service to `dtuhidd` for the whole boot.
+  static func isLegacyHIDSuppressed(coreSimulatorVersion: String?) -> Bool {
+    shipsDTUHID(coreSimulatorVersion: coreSimulatorVersion)
+  }
+
+  /// Apple TV stays on Indigo: the Siri Remote trackpad rides an Indigo service `dtuhidd` lacks.
+  static func defaultTransport(coreSimulatorVersion: String?, isAppleTV: Bool) -> FBSimulatorHIDTransportType {
+    shipsDTUHID(coreSimulatorVersion: coreSimulatorVersion) && !isAppleTV ? .dtuhid : .indigo
   }
 }
 
-// MARK: - Simulator process tree
+extension FBSimulator {
 
-private extension FBProcessFetcher {
-
-  /// The host `launchd_sim` process backing the simulator with `udid`, matched by the UDID in its
-  /// arguments, or `nil` if it cannot be found (e.g. the simulator is not booted).
-  func launchdSim(forSimulatorUDID udid: String) -> FBProcessInfo? {
-    processes(withProcessName: "launchd_sim").first { process in
-      process.arguments.contains { $0.contains(udid) }
-    }
+  /// Whether this simulator's legacy HID keyboard service is handed to `dtuhidd` (Xcode 27,
+  /// CoreSimulator-1155.4 and later), so legacy keyboard events produce no text.
+  var isLegacyHIDSuppressed: Bool {
+    FBSimulatorHIDTransportSelection.isLegacyHIDSuppressed(
+      coreSimulatorVersion: FBSimulatorControlFrameworkLoader.loadedCoreSimulatorVersion)
   }
 
-  /// The process identifier of a subprocess of the simulator's `launchd_sim` whose name contains
-  /// `name`, or `nil` if there is none. A purely host-side query of the simulator's process subtree.
-  func simulatorSubprocess(named name: String, forSimulatorUDID udid: String) -> pid_t? {
-    guard let launchdSim = launchdSim(forSimulatorUDID: udid) else {
-      return nil
-    }
-    let identifier = subprocess(of: launchdSim.processIdentifier, withName: name)
-    return identifier > 0 ? identifier : nil
+  /// The HID transport to use when a caller does not request one.
+  var defaultHIDTransport: FBSimulatorHIDTransportType {
+    FBSimulatorHIDTransportSelection.defaultTransport(
+      coreSimulatorVersion: FBSimulatorControlFrameworkLoader.loadedCoreSimulatorVersion,
+      isAppleTV: productFamily == .familyAppleTV)
   }
 }
 

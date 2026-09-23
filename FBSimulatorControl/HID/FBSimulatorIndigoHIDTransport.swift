@@ -30,7 +30,7 @@ actor FBSimulatorIndigoHIDTransport: FBSimulatorHIDTransport {
   private let mainScreenSize: CGSize
   /// The scale of the main screen.
   private let mainScreenScale: Float
-  /// Whether an active `dtuhidd` has suppressed this simulator's legacy keyboard HID, captured from
+  /// Whether this simulator's legacy keyboard HID is handed to `dtuhidd`, captured from
   /// `FBSimulator.isLegacyHIDSuppressed` when the transport is built. `sendKeyboard` fails loudly on
   /// it rather than typing into the void; the DTUHID transport is the workaround.
   private let legacyKeyboardSuppressed: Bool

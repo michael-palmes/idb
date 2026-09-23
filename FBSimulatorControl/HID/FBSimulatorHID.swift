@@ -51,8 +51,8 @@ public final class FBSimulatorHID: CustomStringConvertible, @unchecked Sendable 
    Creates a `FBSimulatorHID` for the provided Simulator.
 
    `transport` selects the HID path. When `nil` (the default) it is resolved with
-   `FBSimulator.defaultHIDTransport` — the DTUHID transport when an active `dtuhidd` has suppressed
-   the legacy HID, and the legacy Indigo path otherwise — so a caller that does not care gets a
+   `FBSimulator.defaultHIDTransport` — the DTUHID transport on CoreSimulator-1155.4 and later
+   (except Apple TV), and the legacy Indigo path otherwise — so a caller that does not care gets a
    working transport without choosing one. Pass an explicit value to force a specific transport. Will
    fail if the chosen transport cannot be established for the provided Simulator (registration may
    need to occur prior to booting).
