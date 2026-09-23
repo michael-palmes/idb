@@ -74,6 +74,34 @@ final class FBSimulatorDTUHIDDrainTests: XCTestCase {
     XCTAssertEqual(barriers.count, 2); XCTAssertEqual(sleeps, [timing.replyTailNanos])
   }
 
+  // MARK: Teardown
+
+  func testCloseDrainsAnUndrainedSend() async throws {
+    let recorder = DrainRecorder(); let transport = makeTransport(recorder)
+    let hid = FBSimulatorHID(transport: transport, transportType: .dtuhid, simulator: nil)
+    try await hid.sendKeyboard(direction: .up, keyCode: 0)
+    await hid.close()
+    let sleeps = await recorder.sleeps
+    XCTAssertEqual(sleeps, [timing.replyTailNanos])
+  }
+
+  func testCloseSkipsTheDrainWhenNothingWasSent() async {
+    let recorder = DrainRecorder(); let hid = makeHID(recorder)
+    await hid.close()
+    let sleeps = await recorder.sleeps, barriers = await recorder.barriers
+    XCTAssertEqual(sleeps, []); XCTAssertEqual(barriers.count, 0)
+  }
+
+  func testCloseDrainsEvenWhenTheCallerIsCancelled() async throws {
+    let recorder = DrainRecorder(); let hid = makeHID(recorder)
+    try await hid.sendKeyboard(direction: .up, keyCode: 0)
+    let closing = Task { await hid.close() }
+    closing.cancel()
+    await closing.value
+    let sleeps = await recorder.sleeps
+    XCTAssertEqual(sleeps, [timing.replyTailNanos])
+  }
+
   // MARK: Helpers
 
   private enum BarrierReply { case answer, timeout }

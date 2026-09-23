@@ -87,10 +87,18 @@ public final class FBSimulatorHID: CustomStringConvertible, @unchecked Sendable 
 
   // MARK: Lifecycle
 
-  /**
-   Disconnects from the remote HID.
-   */
+  /// Disconnects immediately without draining. Prefer `close()`.
   public func disconnect() {
+    transport.disconnect()
+  }
+
+  /// Drains pending events before disconnecting, even if the caller is cancelled (the drain runs in
+  /// an unstructured task). Drain errors do not prevent disconnection. An idle or already-drained
+  /// connection returns immediately.
+  public func close() async {
+    let transport = self.transport
+    let drain = Task { try await transport.flush() }
+    try? await drain.value
     transport.disconnect()
   }
 

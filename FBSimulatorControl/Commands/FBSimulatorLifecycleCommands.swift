@@ -259,7 +259,7 @@ public final class FBSimulatorLifecycleCommands: NSObject, FBiOSTargetCommand {
     // Detach before suspending so a concurrent connect starts afresh.
     hidConnection = nil
     if let hid = try? await connection.value {
-      hid.disconnect()
+      await hid.close()
     }
   }
 
