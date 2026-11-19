@@ -58,6 +58,11 @@ public final class FBSimulatorAccessibilityCommands: NSObject, AsyncAccessibilit
     runtimeVersion.majorVersion >= 27
   }
 
+  /// A request bootstraps unless a caller has marked the simulator held, vouching that an automation session stays open.
+  static func bootstrapsBeforeRequest(runtimeVersion: OperatingSystemVersion, udid: String) -> Bool {
+    requiresAccessibilityBootstrap(for: runtimeVersion) && !FBSimulatorControlFrameworkLoader.isAccessibilityHeld(forSimulatorUDID: udid)
+  }
+
   private weak var simulator: FBSimulator?
 
   /// Test injection seam: when set, overrides the simulator's shared dispatcher.
@@ -120,7 +125,7 @@ public final class FBSimulatorAccessibilityCommands: NSObject, AsyncAccessibilit
       throw FBAccessibilityError.accessibilityUnavailable
     }
     try FBSimulatorControlFrameworkLoader.accessibilityFrameworks.loadPrivateFrameworks(simulator.logger)
-    if Self.requiresAccessibilityBootstrap(for: simulator.osVersion.version) {
+    if Self.bootstrapsBeforeRequest(runtimeVersion: simulator.osVersion.version, udid: simulator.udid) {
       try FBSimulatorControlFrameworkLoader.bootstrapAccessibility(
         forSimulatorDevice: simulator.device,
         timeout: 5,
